@@ -1,0 +1,46 @@
+{
+  "format": "neo.plugin/1",
+  "id": "neo.preos",
+  "version": 1,
+  "collection": "depth",
+  "kind": "native",
+  "role": "entry",
+  "entry": "neo_depth_main",
+  "requires": [
+    "neo.language"
+  ],
+  "sources": [
+    "common/hosted.c",
+    "common/lattice.c",
+    "common/events.c",
+    "common/presentation.c",
+    "common/ports.c"
+  ],
+  "targets": {
+    "x86_64/Windows": {
+      "sources": [
+        "common/exercise.c",
+        "common/launch.c",
+        "common/ports_test.c",
+        "common/services_test.c"
+      ]
+    },
+    "x86_64/Linux": {
+      "sources": [
+        "common/exercise.c",
+        "common/launch.c",
+        "common/ports_test.c",
+        "common/services_test.c"
+      ]
+    },
+    "x86_64/x86_64": {
+      "requires": [
+        "neo.image.exercise"
+      ]
+    }
+  },
+  "abi": 1,
+  "includes": [
+    "common"
+  ]
+}

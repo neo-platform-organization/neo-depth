@@ -1,41 +1,35 @@
 # neo depth
 
-This repository contains neo's depth kernel: native platform providers,
-resource services, preOS/CLI orchestration, and their tests. The surface VM defines the public language contract and validates both native
-interfaces before startup. The graph/compiler implementation lives here.
+This is passive implementation material for the neo VM builder. It contains
+source, headers, and standard neo.plugin/1 manifests. It does not decide which
+parts the VM includes and has no independent build entry or plugin manager.
 
-The repositories are independent siblings:
+The independent repositories are siblings:
 
 ```text
 workdir/
-  neo/        surface VM and build entry
+  neo/        surface VM, input/plugin catalog, and the one Makefile
   depth/      this repository (GitHub: neo-depth)
-  neo-image/  live image (neo-os/image.neo)
+  neo-image/  live graph data and programs
 ```
 
-Build from the surface repository using its single root Makefile. There is no
-separate build file or workflow here. Outputs remain build/ARCH/TARGET/ in
-the surface repository.
+From neo/, run make configure. First choose whether the VM should include any
+depth components, then select compatible plugins from the input/plugin list.
+No builds a bootstrap VM without these implementations. Yes does not include
+everything automatically: dependency resolution follows the selected entries.
 
-## Structure
+- platform.plugin.json describes target support and resource mechanisms.
+- language.plugin.json describes the graph engine and compiler material.
+- preos.plugin.json describes CLI/REPL and launcher mechanisms.
+- plugins/ contains OS/architecture implementations, not a second manager.
+- language/ contains the language implementation and its typed exports.
+- common/ contains resource and preOS implementations and tests.
+- tools/ contains acceptance and boot-test tools used for selected full builds.
 
-- language/: graph engine, JIT implementation, Weft lowering, and language provider.
-- plugins/: Windows, Linux, and standalone x86_64 providers and device adapters.
-- provider.c: registers the selected provider through the surface-owned ABI.
-- bindings.h: keeps private provider symbols separate from the public surface.
-- common/: resource handles, event pumping, framebuffer transport, the REPL,
-  hosted runners, launcher mechanisms, and acceptance tests.
-- tools/: regression fixtures, source embedding, and QEMU boot checks.
+The VM owns inclusion, validates the compiled interfaces, and controls startup.
+Native material is trusted code after it is selected and compiled; a repository
+split is not a security boundary. Current components are coarse. Individual
+CPU schedulers or GPU drivers are not implemented merely by this packaging.
 
-The current plugin is linked at build time. ABI version 1 checks version,
-structure size, required operations, and lifetime. It supports early standalone
-boot without a host dynamic loader. It does not yet load arbitrary shared
-libraries, hot-swap live providers, implement a general CPU scheduler, or supply
-new GPU drivers. Those can be added here as real providers/services later.
-
-Depth plugins are trusted native code. Moving code into a plugin does not
-sandbox it. Language/package grants remain enforced at the surface and service
-boundaries; platform workers retain their existing host containment.
-
-The preOS is a depth facility. Application behavior belongs in neo-image.
-Detailed launcher and language milestones remain in the surface documentation.
+See neo/documentation/development/plugin-selection.md in the sibling surface
+repository for the format, commands, validation, and current limitations.

@@ -575,12 +575,12 @@ static int neo_security_selftest(const neo_code_platform *platform, const char *
     if (!neo_depth_validate(&invalid)) { return 1; }
     invalid=*provider;
     if (!neo_depth_install(&invalid)) { return 1; }
-    neo_language_plugin bad_language=*provider->language;
+    neo_language_plugin bad_language=*neo_depth_language();
     bad_language.abi=0;
     if (!neo_language_validate(&bad_language)) { return 1; }
-    bad_language=*provider->language; bad_language.neo_session_open=NULL;
+    bad_language=*neo_depth_language(); bad_language.neo_session_open=NULL;
     if (!neo_language_validate(&bad_language)) { return 1; }
-    bad_language=*provider->language; bad_language.bytes=0;
+    bad_language=*neo_depth_language(); bad_language.bytes=0;
     if (!neo_language_validate(&bad_language)) { return 1; }
     if (neo_depth_validate(provider)) { return 1; }
     puts("PASS depth plugin ABI: version, size, required operations, and replacement guard");

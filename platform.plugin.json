@@ -1,0 +1,62 @@
+{
+  "format": "neo.plugin/1",
+  "id": "neo.platform",
+  "version": 1,
+  "collection": "depth",
+  "kind": "native",
+  "role": "platform",
+  "entry": "neo_depth_provider",
+  "requires": [],
+  "sources": [
+    "provider.c",
+    "common/services.c",
+    "common/console.c"
+  ],
+  "targets": {
+    "x86_64/Windows": {
+      "sources": [
+        "plugins/windows.c",
+        "plugins/services_windows.c"
+      ],
+      "libraries": [
+        "-luserenv",
+        "-lws2_32",
+        "-lbcrypt",
+        "-lgdi32",
+        "-lopengl32",
+        "-lwinmm"
+      ]
+    },
+    "x86_64/Linux": {
+      "sources": [
+        "plugins/linux.c",
+        "plugins/services_linux.c"
+      ],
+      "libraries": [
+        "-lseccomp",
+        "-lX11",
+        "-lGL",
+        "-lasound",
+        "-pthread"
+      ]
+    },
+    "x86_64/x86_64": {
+      "sources": [
+        "plugins/x86_64/libc.c",
+        "plugins/x86_64/boot.c",
+        "plugins/x86_64/interrupts.c"
+      ],
+      "assembly": [
+        "plugins/x86_64/entry.S"
+      ],
+      "embeds_image": [
+        "plugins/x86_64/boot.c"
+      ]
+    }
+  },
+  "abi": 2,
+  "includes": [
+    ".",
+    "common"
+  ]
+}
