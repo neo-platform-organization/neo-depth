@@ -1,0 +1,13 @@
+/build/
+.cache/
+node_modules/
+__pycache__/
+*.o
+*.obj
+*.exe
+*.bin
+*.iso
+*.log
+*.tmp
+.env
+.env.*
