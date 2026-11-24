@@ -138,6 +138,8 @@ static neo_status neo_windows_gl_draw(neo_windows_resource *resource) {
         if (memcmp(sample,resource->pixels,3)) { return NEO_DEVICE_LOST; }
     }
     resource->bind_framebuffer(0x8d40,0); glDrawBuffer(GL_BACK); glReadBuffer(GL_BACK);
+    RECT client; GetClientRect(resource->window,&client);
+    glViewport(0,0,client.right-client.left,client.bottom-client.top);
     glBindTexture(GL_TEXTURE_2D,resource->rendered_texture);
     glBegin(GL_QUADS);
     glTexCoord2f(0,0); glVertex2f(-1,-1); glTexCoord2f(u,0); glVertex2f(1,-1);
@@ -176,6 +178,9 @@ static LRESULT CALLBACK neo_surface_procedure(HWND window, UINT message, WPARAM 
         input.kind=NEO_INPUT_KEY; input.code=(int32_t)((lparam>>16)&0x1ff);
         input.pressed=message==WM_KEYDOWN || message==WM_SYSKEYDOWN;
         neo_windows_queue(resource,input); break;
+    case WM_PASTE:
+        input.kind=NEO_INPUT_KEY; input.code=NEO_KEY_V; input.modifiers=2; input.pressed=true;
+        neo_windows_queue(resource,input); return 0;
     case WM_CHAR: {
         wchar_t characters[2]={(wchar_t)wparam,0}; int count=1;
         if (wparam>=0xd800 && wparam<=0xdbff) { resource->surrogate=(wchar_t)wparam; return 0; }
@@ -210,7 +215,9 @@ static LRESULT CALLBACK neo_surface_procedure(HWND window, UINT message, WPARAM 
             info.bV4Height=-(LONG)resource->height; info.bV4Planes=1; info.bV4BitCount=32; info.bV4V4Compression=BI_BITFIELDS;
             info.bV4RedMask=0xff; info.bV4GreenMask=0xff00; info.bV4BlueMask=0xff0000; info.bV4AlphaMask=0xff000000;
             info.bV4CSType=0x73524742u;
-            SetDIBitsToDevice(dc,0,0,resource->width,resource->height,0,0,0,resource->height,resource->pixels,(const BITMAPINFO *)&info,DIB_RGB_COLORS);
+            RECT client; GetClientRect(window,&client);
+            StretchDIBits(dc,0,0,client.right-client.left,client.bottom-client.top,0,0,(int)resource->width,(int)resource->height,
+                resource->pixels,(const BITMAPINFO *)&info,DIB_RGB_COLORS,SRCCOPY);
         }
         EndPaint(window,&paint);
         if (resource->pixels && resource->gl) { (void)neo_windows_gl_draw(resource); }
@@ -274,7 +281,10 @@ static void neo_windows_bind(void *context, void *native, neo_handle handle) {
             .height=(uint32_t)(rectangle.bottom-rectangle.top),.scale=(double)GetDpiForWindow(resource->window)/96.0};
         neo_windows_queue(resource,input);
     }
-    if (resource->kind==NEO_RESOURCE_SURFACE && resource->owner->visible) { ShowWindow(resource->window,SW_SHOW); }
+    if (resource->kind==NEO_RESOURCE_SURFACE && resource->owner->visible) {
+        ShowWindow(resource->window,SW_SHOW);
+        SetWindowPos(resource->window,NULL,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_SHOWWINDOW);
+    }
 }
 static neo_status neo_windows_present(void *context, void *native, const neo_frame *frame) {
     (void)context;
@@ -550,6 +560,44 @@ static neo_status neo_windows_root(void *context, const char *path, void **outpu
     resource->owner=context; resource->kind=NEO_RESOURCE_ROOT; resource->file=directory;
     *output=resource; return NEO_OK;
 }
+static neo_status neo_windows_directory_list(void *context,void *native,neo_directory_entry *entries,size_t capacity,size_t *count) {
+    (void)context; neo_windows_resource *root=native; wchar_t pattern[1100];
+    int length=swprintf(pattern,1100,L"%ls\\*",root->path); if (length<0 || length>=1100) { return NEO_TRUNCATED; }
+    WIN32_FIND_DATAW data; HANDLE search=FindFirstFileW(pattern,&data);
+    if (search==INVALID_HANDLE_VALUE) { return GetLastError()==ERROR_FILE_NOT_FOUND ? NEO_OK : NEO_IO_ERROR; }
+    neo_status status=NEO_OK;
+    for (;;) {
+        if (wcscmp(data.cFileName,L".") && wcscmp(data.cFileName,L"..") && !(data.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)) {
+            if (*count==capacity) { status=NEO_TRUNCATED; break; }
+            neo_directory_entry *entry=&entries[*count];
+            if (!WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,data.cFileName,-1,entry->name,sizeof(entry->name),NULL,NULL)) { status=NEO_TRUNCATED; break; }
+            entry->directory=(data.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
+            entry->bytes=((uint64_t)data.nFileSizeHigh<<32)|data.nFileSizeLow; ++*count;
+        }
+        if (!FindNextFileW(search,&data)) { if (GetLastError()!=ERROR_NO_MORE_FILES) { status=NEO_IO_ERROR; } break; }
+    }
+    FindClose(search); return status;
+}
+static neo_status neo_windows_file_read(void *context,void *native,const char *name,void *bytes,size_t capacity,size_t *length) {
+    (void)context; neo_windows_resource *root=native; wchar_t component[512],path[1600];
+    if (!MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,name,-1,component,512)) { return NEO_INVALID; }
+    int count=swprintf(path,1600,L"%ls\\%ls",root->path,component); if (count<0 || count>=1600) { return NEO_TRUNCATED; }
+    HANDLE file=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,NULL);
+    if (file==INVALID_HANDLE_VALUE) { return NEO_IO_ERROR; }
+    neo_status status=NEO_OK; LARGE_INTEGER size;
+    if (!neo_windows_plain(file,false)) { status=NEO_DENIED; }
+    else if (!GetFileSizeEx(file,&size)) { status=NEO_IO_ERROR; }
+    else if (size.QuadPart<0 || (uint64_t)size.QuadPart>capacity) { status=NEO_TRUNCATED; }
+    while (status==NEO_OK && *length<capacity) {
+        DWORD transferred=0;
+        if (!ReadFile(file,(unsigned char *)bytes+*length,(DWORD)(capacity-*length),&transferred,NULL)) { status=NEO_IO_ERROR; break; }
+        if (!transferred) { break; } *length+=transferred;
+    }
+    if (status==NEO_OK && *length==capacity) { unsigned char extra; DWORD transferred=0;
+        if (!ReadFile(file,&extra,1,&transferred,NULL)) { status=NEO_IO_ERROR; } else if (transferred) { status=NEO_TRUNCATED; }
+    }
+    CloseHandle(file); return status;
+}
 static neo_status neo_windows_lock(neo_windows_resource *root, const char *key, HANDLE *lock) {
     wchar_t path[1200];
     if (!neo_windows_name(root,key,L".lock",path)) { return NEO_INVALID; }
@@ -714,7 +762,46 @@ static neo_status neo_windows_renderer_name(void *context, void *native, char *t
     int count=snprintf(text,capacity,"opengl: %s",(const char *)driver);
     return count>=0 && (size_t)count<capacity ? NEO_OK : NEO_TRUNCATED;
 }
+static neo_status neo_windows_user_directory(void *context,neo_directory_kind kind,bool create,char *path,size_t capacity) {
+    (void)context;
+    if (kind!=NEO_DIRECTORY_CONFIG && kind!=NEO_DIRECTORY_DATA) { return NEO_INVALID; }
+    wchar_t base[1024],directory[1100];
+    DWORD length=GetEnvironmentVariableW(L"LOCALAPPDATA",base,1024);
+    if (!length || length>=1024) { return NEO_UNSUPPORTED; }
+    int count=swprintf(directory,1100,L"%ls\\neo",base);
+    if (count<0 || count>=1100) { return NEO_EXHAUSTED; }
+    if (create && !CreateDirectoryW(directory,NULL) && GetLastError()!=ERROR_ALREADY_EXISTS) { return NEO_IO_ERROR; }
+    HANDLE handle=CreateFileW(directory,FILE_LIST_DIRECTORY,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,
+        OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,NULL);
+    if (handle==INVALID_HANDLE_VALUE) { return NEO_IO_ERROR; }
+    bool plain=neo_windows_plain(handle,true); CloseHandle(handle);
+    if (!plain) { return NEO_DENIED; }
+    if (kind==NEO_DIRECTORY_DATA) {
+        count=swprintf(directory,1100,L"%ls\\neo\\images",base);
+        if (count<0 || count>=1100) { return NEO_EXHAUSTED; }
+        if (create && !CreateDirectoryW(directory,NULL) && GetLastError()!=ERROR_ALREADY_EXISTS) { return NEO_IO_ERROR; }
+        handle=CreateFileW(directory,FILE_LIST_DIRECTORY,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,
+            OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,NULL);
+        if (handle==INVALID_HANDLE_VALUE) { return NEO_IO_ERROR; }
+        plain=neo_windows_plain(handle,true); CloseHandle(handle);
+        if (!plain) { return NEO_DENIED; }
+    }
+    int needed=WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,directory,-1,NULL,0,NULL,NULL);
+    if (!needed || (size_t)needed>capacity) { return NEO_TRUNCATED; }
+    return WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,directory,-1,path,needed,NULL,NULL) ? NEO_OK : NEO_IO_ERROR;
+}
+static neo_status neo_windows_appearance(void *context,bool *dark) {
+    (void)context; DWORD light=1,size=sizeof(light);
+    LSTATUS status=RegGetValueW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        L"AppsUseLightTheme",RRF_RT_REG_DWORD,NULL,&light,&size);
+    *dark=status==ERROR_SUCCESS && !light;
+    return status==ERROR_SUCCESS ? NEO_OK : NEO_UNSUPPORTED;
+}
 neo_status neo_platform_services(bool visible, neo_services **output) {
+    /* WGL's drawable follows process DPI awareness as well as the caller's
+       thread context. Establish both before constructing any platform window. */
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     *output=NULL;
     WSADATA data;
     if (WSAStartup(MAKEWORD(2,2),&data)) { return NEO_IO_ERROR; }
@@ -731,7 +818,7 @@ neo_status neo_platform_services(bool visible, neo_services **output) {
         .store_list=neo_windows_list,.store_delete=neo_windows_delete,.store_step=neo_windows_store_step,.endpoint=neo_windows_endpoint,
         .standard=neo_windows_standard,.renderer=neo_windows_renderer,.renderer_name=neo_windows_renderer_name,
         .audio=neo_windows_audio,.audio_stats=neo_windows_audio_stats,.clipboard=neo_windows_clipboard,
-        .position=neo_windows_position,.destroy=neo_windows_destroy};
+        .position=neo_windows_position,.destroy=neo_windows_destroy,.appearance=neo_windows_appearance,.user_directory=neo_windows_user_directory,.directory_list=neo_windows_directory_list,.file_read=neo_windows_file_read};
     neo_capabilities capabilities={true,true,true,true,true,true,true};
     neo_status status=neo_services_open(&backend,context,capabilities,output);
     if (status!=NEO_OK) { neo_windows_destroy(context); }

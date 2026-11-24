@@ -41,13 +41,33 @@ async function qmp() {
 }
 try {
     const command=await qmp();
-    await waitFor(()=>serial.includes('NEO x86_64 ready'));
+    await waitFor(()=>serial.includes('firmware exited, trusted code only'));
     assert.ok(serial.includes('firmware exited, trusted code only'),serial);
     if(mode==='cli') {
         child.stdin.write('revision\nsend instrument sample 21\nsend instrument reading\nquit\n');
         await waitFor(()=>serial.includes('NEO image stopped 0'));
         assert.match(serial,/revision 1/);assert.equal((serial.match(/result 42/g)??[]).length,2,serial);
         console.log('PASS x86_64: boot services exited; standalone CLI and JIT execute the canonical image');
+    } else if(mode==='manager') {
+        await waitFor(()=>serial.includes('neo manager ready'));
+        const bundled=Number(/neo_bundle_count = (\d+);/.exec(readFileSync(join(out,'image.inc'),'utf8'))?.[1]);
+        assert.ok(bundled>0 && bundled<=8);
+        assert.ok(serial.includes(`NEO UEFI bootstrap: bundle images ${bundled}`),serial);
+        assert.ok(serial.includes(`neo manager library ${bundled} images`),serial);
+        const screenshot=join(temporary,'manager.ppm');
+        await command('screendump',{filename:screenshot});
+        const pixels=readFileSync(screenshot);
+        const header=/^P6\n(\d+) (\d+)\n255\n/.exec(pixels.subarray(0,100).toString());
+        assert.ok(header,'Missing manager framebuffer');
+        assert.equal(Number(header[1]),1024);assert.equal(Number(header[2]),768);
+        const offset=header[0].length+(24*1024+300)*3;
+        const color=[...pixels.subarray(offset,offset+3)];
+        assert.ok(color.every(value=>value>120) && Math.max(...color)-Math.min(...color)<60,color);
+        await command('input-send-event',{events:[{type:'rel',data:{axis:'x',value:288}},{type:'rel',data:{axis:'y',value:175}}]});
+        await command('input-send-event',{events:[{type:'btn',data:{down:true,button:'left'}}]});
+        await command('input-send-event',{events:[{type:'btn',data:{down:false,button:'left'}}]});
+        await waitFor(()=>serial.includes('neo manager result 42'));
+        console.log('PASS x86_64 manager: shared GUI framebuffer, bundled image discovery, PS/2 selection and native image launch');
     } else {
         await waitFor(()=>serial.includes('NEO frame 53 53 53'));
         await command('input-send-event',{events:[{type:'btn',data:{down:true,button:'left'}}]});

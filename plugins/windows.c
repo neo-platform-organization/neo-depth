@@ -3,6 +3,7 @@
 #include "platform.h"
 
 #include <windows.h>
+#include <shellapi.h>
 #include <userenv.h>
 #include <wchar.h>
 #include <stdio.h>
@@ -25,20 +26,56 @@ void *neo_platform_calloc(size_t count, size_t bytes) {
 }
 void *neo_platform_realloc(void *memory, size_t bytes) { return _aligned_realloc(memory,bytes ? bytes : 1,16); }
 void neo_platform_free(void *memory) { _aligned_free(memory); }
+const char *neo_platform_arguments(int *argc,char ***argv) {
+    int count=0; wchar_t **wide=CommandLineToArgvW(GetCommandLineW(),&count);
+    if (!wide || count<1) { if (wide) { LocalFree(wide); } return "could not decode command line"; }
+    size_t bytes=((size_t)count+1)*sizeof(char *);
+    for (int i=0;i<count;++i) {
+        int length=WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,wide[i],-1,NULL,0,NULL,NULL);
+        if (length<=0 || (size_t)length>SIZE_MAX-bytes) { LocalFree(wide); return "invalid Unicode command line"; }
+        bytes+=(size_t)length;
+    }
+    char **values=neo_platform_malloc(bytes);
+    if (!values) { LocalFree(wide); return "out of memory"; }
+    char *text=(char *)(values+(size_t)count+1);
+    for (int i=0;i<count;++i) {
+        int length=WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,wide[i],-1,NULL,0,NULL,NULL);
+        values[i]=text;
+        if (length<=0 || WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,wide[i],-1,text,length,NULL,NULL)!=length) {
+            neo_platform_free(values); LocalFree(wide); return "invalid Unicode command line";
+        }
+        text+=(size_t)length;
+    }
+    values[count]=NULL; LocalFree(wide); *argc=count; *argv=values; return NULL;
+}
+FILE *neo_platform_file_open(const char *path,const char *mode) {
+    if (!path || !mode || (strcmp(mode,"rb") && strcmp(mode,"wb"))) { return NULL; }
+    int length=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,path,-1,NULL,0);
+    if (length<=0) { return NULL; }
+    wchar_t *wide=neo_platform_malloc((size_t)length*sizeof(*wide));
+    if (!wide) { return NULL; }
+    FILE *stream=NULL;
+    if (MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,path,-1,wide,length)==length) {
+        stream=_wfopen(wide,!strcmp(mode,"rb") ? L"rb" : L"wb");
+    }
+    neo_platform_free(wide); return stream;
+}
 
 typedef struct {
-    size_t length;
-    unsigned char code[NEO_NATIVE_CODE_LIMIT];
-    int32_t slots[NEO_NATIVE_SLOTS];
+    size_t length, capacity, words;
     int64_t result;
     bool complete;
+    unsigned char code[NEO_NATIVE_CODE_LIMIT];
+    int32_t slots[];
 } neo_native_packet;
+static size_t neo_packet_bytes(size_t capacity) { return offsetof(neo_native_packet,slots)+capacity*sizeof(int32_t); }
 
 typedef struct {
     HANDLE mapping, request, response, job, process;
     neo_native_packet *packet;
     PSID sid;
     wchar_t name[96];
+    size_t capacity;
 } neo_native_channel;
 
 static neo_native_channel neo_channel;
@@ -73,21 +110,23 @@ void neo_native_begin(void) {
 }
 
 static const char *neo_exchange(neo_native_channel *channel, const unsigned char *code,
-                                size_t length, int32_t *slots, int64_t *result) {
+                                size_t length, int32_t *slots, size_t words, int64_t *result) {
     neo_native_packet *packet=channel->packet;
     packet->length=length;
+    packet->words=words;
     packet->complete=false;
     memcpy(packet->code,code,length);
-    memcpy(packet->slots,slots,sizeof(packet->slots));
+    memset(packet->slots,0,channel->capacity*sizeof(*slots));
+    memcpy(packet->slots,slots,words*sizeof(*slots));
     if (!SetEvent(channel->request)) { return "native worker signal failed"; }
     HANDLE handles[]={channel->response,channel->process};
     DWORD wait=WaitForMultipleObjects(2,handles,FALSE,2000);
     if (wait==WAIT_TIMEOUT) { return "native worker timed out"; }
-    if (wait!=WAIT_OBJECT_0 || !packet->complete ||
+    if (wait!=WAIT_OBJECT_0 || !packet->complete || packet->words!=words || packet->capacity!=channel->capacity || packet->length!=length ||
         WaitForSingleObject(channel->process,0)==WAIT_OBJECT_0) {
         return "native worker failed";
     }
-    memcpy(slots,packet->slots,sizeof(packet->slots));
+    memcpy(slots,packet->slots,words*sizeof(*slots));
     *result=packet->result;
     return NULL;
 }
@@ -112,10 +151,16 @@ int neo_native_worker(const char *handle_text) {
     HANDLE response=(HANDLE)(uintptr_t)raw;
     neo_native_packet *packet=MapViewOfFile(mapping,FILE_MAP_WRITE,0,0,sizeof(*packet));
     if (!packet) { return 1; }
+    size_t capacity=packet->capacity;
+    UnmapViewOfFile(packet);
+    if (!capacity || capacity>NEO_NATIVE_SLOTS) { return 1; }
+    packet=MapViewOfFile(mapping,FILE_MAP_WRITE,0,0,neo_packet_bytes(capacity));
+    if (!packet) { return 1; }
     for (;;) {
         if (WaitForSingleObject(request,INFINITE)!=WAIT_OBJECT_0) { return 1; }
         size_t length=packet->length;
-        if (!length || length>sizeof(packet->code)) { return 1; }
+        size_t words=packet->words;
+        if (!length || length>sizeof(packet->code) || packet->capacity!=capacity || !words || words>capacity) { return 1; }
         void *memory=VirtualAlloc(NULL,length,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
         if (!memory) { return 1; }
         memcpy(memory,packet->code,length);
@@ -127,15 +172,21 @@ int neo_native_worker(const char *handle_text) {
         memcpy(&entry,&memory,sizeof(entry));
         packet->result=entry(packet->slots);
         VirtualFree(memory,0,MEM_RELEASE);
+        if (packet->capacity!=capacity || packet->words!=words || packet->length!=length) { return 1; }
         packet->complete=true;
         if (!SetEvent(response)) { return 1; }
     }
 }
 const char *neo_native_execute(const unsigned char *code, size_t length,
-                               int32_t *slots, int64_t *result) {
+                               int32_t *slots, size_t words, int64_t *result) {
     if (!length || length>NEO_NATIVE_CODE_LIMIT) { return "invalid native code length"; }
+    size_t capacity=neo_native_capacity(words);
+    if (!capacity || !slots || !result) { return "invalid native frame size"; }
+    if (neo_channel.process && words>neo_channel.capacity) {
+        bool keep=neo_keep_worker; neo_native_end(); neo_keep_worker=keep;
+    }
     if (neo_channel.process) {
-        const char *failure=neo_exchange(&neo_channel,code,length,slots,result);
+        const char *failure=neo_exchange(&neo_channel,code,length,slots,words,result);
         if (failure) {
             bool keep=neo_keep_worker;
             neo_native_end();
@@ -146,9 +197,9 @@ const char *neo_native_execute(const unsigned char *code, size_t length,
     const char *failure="could not configure native worker";
     SECURITY_ATTRIBUTES inheritance={sizeof(inheritance),NULL,TRUE};
     HANDLE mapping=CreateFileMappingW(INVALID_HANDLE_VALUE,&inheritance,PAGE_READWRITE,0,
-                                     sizeof(neo_native_packet),NULL);
+                                     (DWORD)neo_packet_bytes(capacity),NULL);
     if (!mapping) { return failure; }
-    neo_native_packet *packet=MapViewOfFile(mapping,FILE_MAP_WRITE,0,0,sizeof(*packet));
+    neo_native_packet *packet=MapViewOfFile(mapping,FILE_MAP_WRITE,0,0,neo_packet_bytes(capacity));
     HANDLE job=NULL;
     HANDLE request=CreateEventW(&inheritance,FALSE,FALSE,NULL);
     HANDLE response=CreateEventW(&inheritance,FALSE,FALSE,NULL);
@@ -159,8 +210,9 @@ const char *neo_native_execute(const unsigned char *code, size_t length,
     PROCESS_INFORMATION process={0};
     if (!packet || !request || !response) { goto done; }
     packet->length=length;
+    packet->capacity=capacity; packet->words=words;
     memcpy(packet->code,code,length);
-    memcpy(packet->slots,slots,sizeof(packet->slots));
+    memcpy(packet->slots,slots,words*sizeof(*slots));
 
     job=CreateJobObjectW(NULL,NULL);
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits={0};
@@ -220,9 +272,10 @@ const char *neo_native_execute(const unsigned char *code, size_t length,
                         &process)) { fprintf(stderr,"CreateProcessW error %lu\n",(unsigned long)GetLastError()); goto done; }
     if (!AssignProcessToJobObject(job,process.hProcess) ||
         ResumeThread(process.hThread)==(DWORD)-1) { fprintf(stderr,"Worker job error %lu\n",(unsigned long)GetLastError()); goto done; }
-    neo_native_channel channel={mapping,request,response,job,process.hProcess,packet,sid,{0}};
+    neo_native_channel channel={.mapping=mapping,.request=request,.response=response,.job=job,.process=process.hProcess,
+        .packet=packet,.sid=sid,.capacity=capacity};
     wcscpy(channel.name,name);
-    failure=neo_exchange(&channel,code,length,slots,result);
+    failure=neo_exchange(&channel,code,length,slots,words,result);
     if (!failure && neo_keep_worker) {
         neo_channel=channel;
         mapping=NULL;

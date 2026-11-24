@@ -1,35 +1,19 @@
 # neo depth
 
-This is passive implementation material for the neo VM builder. It contains
-source, headers, and standard neo.plugin/1 manifests. It does not decide which
-parts the VM includes and has no independent build entry or plugin manager.
+Depth contains support for particular operating systems and machines:
+Windows/Linux adapters, standalone x86_64 boot and devices, and platform
+registration. Generic language, JIT, services, and preOS implementation belong
+in the sibling surface repository under neo-vm/language and neo-vm/common.
 
-The independent repositories are siblings:
+Depth is passive source material described by neo.plugin/1 manifests. The VM
+builder owns selection through its input/plugin catalog and single Makefile.
+platform.plugin.json depends on the surface neo.services library. It does not
+contain a language or preOS implementation.
 
-```text
-workdir/
-  neo/        surface VM, input/plugin catalog, and the one Makefile
-  depth/      this repository (GitHub: neo-depth)
-  neo-image/  live graph data and programs
-```
+Native components are trusted code. Packaging is not a security sandbox.
+cpu/x86_64.c implements the surface machine.h contract. cpu.plugin.json
+registers neo.cpu.x86_64, required by the surface language component. It owns
+native instruction encoding and relocations; language decisions stay in neo.
 
-From neo/, run make configure. First choose whether the VM should include any
-depth components, then select compatible plugins from the input/plugin list.
-No builds a bootstrap VM without these implementations. Yes does not include
-everything automatically: dependency resolution follows the selected entries.
-
-- platform.plugin.json describes target support and resource mechanisms.
-- language.plugin.json describes the graph engine and compiler material.
-- preos.plugin.json describes CLI/REPL and launcher mechanisms.
-- plugins/ contains OS/architecture implementations, not a second manager.
-- language/ contains the language implementation and its typed exports.
-- common/ contains resource and preOS implementations and tests.
-- tools/ contains acceptance and boot-test tools used for selected full builds.
-
-The VM owns inclusion, validates the compiled interfaces, and controls startup.
-Native material is trusted code after it is selected and compiled; a repository
-split is not a security boundary. Current components are coarse. Individual
-CPU schedulers or GPU drivers are not implemented merely by this packaging.
-
-See neo/documentation/development/plugin-selection.md in the sibling surface
-repository for the format, commands, validation, and current limitations.
+Repositories remain independent siblings: neo, depth, neo-image.
+Build from neo with make configure and make test. There is no depth build script.

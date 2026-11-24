@@ -6,11 +6,11 @@
   "kind": "native",
   "role": "platform",
   "entry": "neo_depth_provider",
-  "requires": [],
+  "requires": [
+    "neo.services"
+  ],
   "sources": [
-    "provider.c",
-    "common/services.c",
-    "common/console.c"
+    "provider.c"
   ],
   "targets": {
     "x86_64/Windows": {
@@ -19,7 +19,9 @@
         "plugins/services_windows.c"
       ],
       "libraries": [
+        "-ladvapi32",
         "-luserenv",
+        "-lshell32",
         "-lws2_32",
         "-lbcrypt",
         "-lgdi32",
@@ -54,9 +56,8 @@
       ]
     }
   },
-  "abi": 2,
+  "abi": 6,
   "includes": [
-    ".",
-    "common"
+    "."
   ]
 }

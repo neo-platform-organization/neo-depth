@@ -16,6 +16,10 @@ const neo_depth_plugin *neo_depth_provider(void) {
         .realloc_bytes=neo_platform_realloc,.free_bytes=neo_platform_free,.execute=neo_native_execute,
         .worker=neo_native_worker,.begin=neo_native_begin,.end=neo_native_end,.worker_id=neo_native_worker_id,
         .events=neo_native_event_platform,.services=neo_platform_services,.selftest=neo_platform_services_selftest,
-        .console_open=neo_console_open,.console_close=neo_console_close,.read_line=neo_platform_read_line};
+        .console_open=neo_console_open,.console_close=neo_console_close,.read_line=neo_platform_read_line
+#if defined(_WIN32)
+        ,.arguments=neo_platform_arguments,.file_open=neo_platform_file_open
+#endif
+    };
     return &provider;
 }

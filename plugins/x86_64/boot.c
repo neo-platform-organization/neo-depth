@@ -10,6 +10,31 @@
 #include "image.inc"
 
 const char *neo_x86_64_image=neo_bundle_source;
+const char *neo_x86_64_lookup(const char *path) {
+    static const char prefix[]="neo/neo-os/";
+    if (strncmp(path,prefix,sizeof(prefix)-1)) { return NULL; }
+    for (size_t i=0;i<neo_bundle_count;++i) { if (!strcmp(path+sizeof(prefix)-1,neo_bundle_images[i].name)) { return neo_bundle_images[i].source; } }
+    return NULL;
+}
+static neo_status neo_x86_64_root(void *context,const char *path,void **native) {
+    if (strcmp(path,"neo/neo-os")) { return NEO_DENIED; } *native=context; return NEO_OK;
+}
+static neo_status neo_x86_64_directory_list(void *context,void *native,neo_directory_entry *entries,size_t capacity,size_t *count) {
+    (void)context; (void)native;
+    if (capacity<neo_bundle_count) { return NEO_TRUNCATED; }
+    for (size_t i=0;i<neo_bundle_count;++i) {
+        strcpy(entries[i].name,neo_bundle_images[i].name); entries[i].directory=false; entries[i].bytes=strlen(neo_bundle_images[i].source);
+    }
+    *count=neo_bundle_count; return NEO_OK;
+}
+static neo_status neo_x86_64_file_read(void *context,void *native,const char *name,void *bytes,size_t capacity,size_t *length) {
+    (void)context; (void)native;
+    for (size_t i=0;i<neo_bundle_count;++i) { if (!strcmp(name,neo_bundle_images[i].name)) {
+        size_t size=strlen(neo_bundle_images[i].source); if (size>capacity) { return NEO_TRUNCATED; }
+        memcpy(bytes,neo_bundle_images[i].source,size); *length=size; return NEO_OK;
+    } }
+    return NEO_EOF;
+}
 static uint64_t *neo_page_entries;
 static unsigned char *neo_code;
 static uint64_t neo_frequency,neo_epoch;
@@ -36,8 +61,9 @@ void neo_native_begin(void) {}
 void neo_native_end(void) {}
 uint32_t neo_native_worker_id(void) { return 0; }
 int neo_native_worker(const char *text) { (void)text; return 1; }
-const char *neo_native_execute(const unsigned char *code,size_t length,int32_t *slots,int64_t *result) {
+const char *neo_native_execute(const unsigned char *code,size_t length,int32_t *slots,size_t words,int64_t *result) {
     if(!length || length>NEO_NATIVE_CODE_LIMIT) { return "invalid native code length"; }
+    if(!words || words>NEO_NATIVE_SLOTS || !slots || !result) { return "invalid native frame size"; }
     neo_protect(neo_code,NEO_NATIVE_CODE_LIMIT,false); memcpy(neo_code,code,length); neo_protect(neo_code,NEO_NATIVE_CODE_LIMIT,true);
     int64_t (__attribute__((ms_abi)) *entry)(int32_t *); void *address=neo_code; memcpy(&entry,&address,sizeof(entry));
     *result=entry(slots); neo_protect(neo_code,NEO_NATIVE_CODE_LIMIT,false); return NULL;
@@ -148,8 +174,9 @@ neo_status neo_platform_services(bool visible,neo_services **output) {
     (void)visible;neo_x86_64_services *context=neo_platform_calloc(1,sizeof(*context));if(!context) { return NEO_EXHAUSTED; }
     neo_service_backend backend={.clock_ns=neo_x86_64_clock,.wait=neo_x86_64_wait,.machine=neo_x86_64_machine,.close=neo_x86_64_close,
         .bind=neo_x86_64_bind,.step=neo_x86_64_step,.surface_open=neo_x86_64_surface,.present=neo_x86_64_present,
-        .input=neo_x86_64_input,.standard=neo_x86_64_standard,.destroy=neo_x86_64_destroy};
-    neo_capabilities capabilities={.input=true,.surfaces=true};neo_status status=neo_services_open(&backend,context,capabilities,output);
+        .input=neo_x86_64_input,.standard=neo_x86_64_standard,.destroy=neo_x86_64_destroy,
+        .root_open=neo_x86_64_root,.directory_list=neo_x86_64_directory_list,.file_read=neo_x86_64_file_read};
+    neo_capabilities capabilities={.input=true,.surfaces=true,.storage=true};neo_status status=neo_services_open(&backend,context,capabilities,output);
     if(status!=NEO_OK) { neo_platform_free(context); }return status;
 }
 bool neo_platform_services_selftest(void) { return false; }
@@ -158,18 +185,21 @@ void neo_x86_64_run(void) {
     printf("NEO x86_64 ready: firmware exited, trusted code only, framebuffer %u x %u\n",neo_width,neo_height);
     char *arguments[]={"neo","surface","neo/neo-os/image.neo",(char *)neo_bundle_object,"software",NULL};
     int count=5;if(!strcmp(neo_bundle_mode,"cli")) { arguments[1]="session";count=3; }
+    if(!strcmp(neo_bundle_mode,"manager")) { arguments[1]="--manager";arguments[2]="--library";arguments[3]="neo/neo-os";count=4; }
     int result=main(count,arguments);printf("NEO image stopped %d\n",result);for(;;) { __asm__ volatile("hlt"); }
 }
 EFI_STATUS efi_main(EFI_HANDLE image,EFI_SYSTEM_TABLE *system) {
     InitializeLib(image,system);
     neo_out(0x3f9,0);neo_out(0x3fb,0x80);neo_out(0x3f8,1);neo_out(0x3f9,0);neo_out(0x3fb,3);neo_out(0x3fa,0xc7);neo_out(0x3fc,0x0b);
-    neo_x86_64_serial("NEO UEFI bootstrap: bundle images 1\n");
+    char boot_message[80]; snprintf(boot_message,sizeof(boot_message),"NEO UEFI bootstrap: bundle images %lu\n",(unsigned long)neo_bundle_count);
+    neo_x86_64_serial(boot_message);
     EFI_GUID guid=EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;EFI_GRAPHICS_OUTPUT_PROTOCOL *graphics=NULL;
     EFI_STATUS status=uefi_call_wrapper(system->BootServices->LocateProtocol,3,&guid,NULL,(void **)&graphics);
     if(EFI_ERROR(status) || !graphics) { neo_x86_64_panic("framebuffer unavailable"); }
     for(UINT32 mode=0;mode<graphics->Mode->MaxMode;++mode) { UINTN size=0;EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info=NULL;
         status=uefi_call_wrapper(graphics->QueryMode,4,graphics,mode,&size,&info);
-        if(!EFI_ERROR(status) && info && info->HorizontalResolution==640 && info->VerticalResolution==480) {
+        if(!EFI_ERROR(status) && info && info->HorizontalResolution==(!strcmp(neo_bundle_mode,"manager") ? 1024u : 640u) &&
+            info->VerticalResolution==(!strcmp(neo_bundle_mode,"manager") ? 768u : 480u)) {
             uefi_call_wrapper(system->BootServices->FreePool,1,info);uefi_call_wrapper(graphics->SetMode,2,graphics,mode);break; }
         if(info) { uefi_call_wrapper(system->BootServices->FreePool,1,info); }
     }

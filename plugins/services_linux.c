@@ -357,6 +357,38 @@ static neo_status neo_linux_root(void *context, const char *path, void **output)
     neo_linux_resource *resource=calloc(1,sizeof(*resource)); if (!resource) { close(fd); return NEO_EXHAUSTED; }
     resource->owner=context; resource->kind=NEO_RESOURCE_ROOT; resource->fd=fd; *output=resource; return NEO_OK;
 }
+static neo_status neo_linux_directory_list(void *context,void *native,neo_directory_entry *entries,size_t capacity,size_t *count) {
+    (void)context; neo_linux_resource *root=native;
+    int fd=openat(root->fd,".",O_RDONLY|O_DIRECTORY|O_CLOEXEC); if (fd<0) { return NEO_IO_ERROR; }
+    DIR *directory=fdopendir(fd); if (!directory) { close(fd); return NEO_IO_ERROR; }
+    neo_status status=NEO_OK; struct dirent *entry;
+    for (;;) {
+        errno=0; entry=readdir(directory);
+        if (!entry) { if (errno) { status=NEO_IO_ERROR; } break; }
+        if (!strcmp(entry->d_name,".") || !strcmp(entry->d_name,"..")) { continue; }
+        struct stat info;
+        if (fstatat(root->fd,entry->d_name,&info,AT_SYMLINK_NOFOLLOW)) { status=NEO_IO_ERROR; break; }
+        if (!S_ISREG(info.st_mode) && !S_ISDIR(info.st_mode)) { continue; }
+        if (*count==capacity || strlen(entry->d_name)>=sizeof(entries[0].name)) { status=NEO_TRUNCATED; break; }
+        neo_directory_entry *item=&entries[(*count)++];
+        strcpy(item->name,entry->d_name); item->directory=S_ISDIR(info.st_mode); item->bytes=info.st_size<0 ? 0 : (uint64_t)info.st_size;
+    }
+    closedir(directory); return status;
+}
+static neo_status neo_linux_file_read(void *context,void *native,const char *name,void *bytes,size_t capacity,size_t *length) {
+    (void)context; neo_linux_resource *root=native;
+    int fd=openat(root->fd,name,O_RDONLY|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK); if (fd<0) { return NEO_IO_ERROR; }
+    struct stat info; neo_status status=NEO_OK;
+    if (fstat(fd,&info) || !S_ISREG(info.st_mode) || info.st_nlink!=1) { status=NEO_DENIED; }
+    else if (info.st_size<0 || (uint64_t)info.st_size>capacity) { status=NEO_TRUNCATED; }
+    while (status==NEO_OK && *length<capacity) {
+        ssize_t count=read(fd,(unsigned char *)bytes+*length,capacity-*length);
+        if (count<0 && errno==EINTR) { continue; }
+        if (count<0) { status=NEO_IO_ERROR; break; } if (!count) { break; } *length+=(size_t)count;
+    }
+    if (status==NEO_OK && *length==capacity) { unsigned char extra; if (read(fd,&extra,1)!=0) { status=NEO_TRUNCATED; } }
+    close(fd); return status;
+}
 static neo_status neo_linux_lock(neo_linux_resource *root, const char *key, int *lock) {
     char name[80]; snprintf(name,sizeof(name),"%s.lock",key);
     *lock=openat(root->fd,name,O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC,0600);
@@ -518,6 +550,41 @@ static neo_status neo_linux_renderer_name(void *context, void *native, char *tex
         int count=snprintf(text,capacity,"opengl: %s",(const char *)driver); return count>=0 && (size_t)count<capacity ? NEO_OK : NEO_TRUNCATED; }
     if (strlen(name)+1>capacity) { return NEO_TRUNCATED; } strcpy(text,name); return NEO_OK;
 }
+static neo_status neo_linux_user_directory(void *context,neo_directory_kind kind,bool create,char *path,size_t capacity) {
+    (void)context;
+    if (kind!=NEO_DIRECTORY_CONFIG && kind!=NEO_DIRECTORY_DATA) { return NEO_INVALID; }
+    const char *base=getenv(kind==NEO_DIRECTORY_CONFIG ? "XDG_CONFIG_HOME" : "XDG_DATA_HOME");
+    char fallback[1024];
+    if (!base || !*base) {
+        const char *home=getenv("HOME");
+        if (!home || *home!='/') { return NEO_UNSUPPORTED; }
+        int count=snprintf(fallback,sizeof(fallback),"%s/%s",home,kind==NEO_DIRECTORY_CONFIG ? ".config" : ".local/share");
+        if (count<0 || (size_t)count>=sizeof(fallback)) { return NEO_EXHAUSTED; }
+        base=fallback;
+    }
+    if (*base!='/') { return NEO_INVALID; }
+    char directory[1200]; int count=snprintf(directory,sizeof(directory),"%s/neo%s",base,kind==NEO_DIRECTORY_DATA ? "/images" : "");
+    if (count<0 || (size_t)count>=sizeof(directory) || (size_t)count>=capacity) { return NEO_TRUNCATED; }
+    /* Walk from / using directory FDs. Refuse symlink traversal and keep
+       creation within the configured user directory rather than a shell. */
+    int parent=open("/",O_RDONLY|O_DIRECTORY|O_CLOEXEC); if (parent<0) { return NEO_IO_ERROR; }
+    char *component=directory+1;
+    while (*component) {
+        char *end=strchr(component,'/'); if (end) { *end=0; }
+        if (!*component || !strcmp(component,".") || !strcmp(component,"..")) { close(parent); return NEO_INVALID; }
+        if (create && mkdirat(parent,component,0700)<0 && errno!=EEXIST) { close(parent); return NEO_IO_ERROR; }
+        int next=openat(parent,component,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+        close(parent);
+        if (next<0) { return errno==ELOOP ? NEO_DENIED : NEO_IO_ERROR; } parent=next;
+        if (!end) { break; } *end='/'; component=end+1;
+    }
+    close(parent); memcpy(path,directory,(size_t)count+1); return NEO_OK;
+}
+static neo_status neo_linux_appearance(void *context,bool *dark) {
+    (void)context; const char *theme=getenv("GTK_THEME");
+    *dark=theme && (strstr(theme,"dark") || strstr(theme,"Dark"));
+    return theme ? NEO_OK : NEO_UNSUPPORTED;
+}
 neo_status neo_platform_services(bool visible, neo_services **output) {
     *output=NULL; neo_linux_services *linux=calloc(1,sizeof(*linux)); if (!linux) { return NEO_EXHAUSTED; }
     linux->wake=eventfd(0,EFD_NONBLOCK|EFD_CLOEXEC); if (linux->wake<0) { free(linux); return NEO_IO_ERROR; }
@@ -529,7 +596,7 @@ neo_status neo_platform_services(bool visible, neo_services **output) {
         .store_read=neo_linux_store_read,.store_replace=neo_linux_replace,.store_delete=neo_linux_delete,.store_list=neo_linux_list,
         .store_step=neo_linux_store_step,.endpoint=neo_linux_endpoint,.standard=neo_linux_standard,
         .renderer=neo_linux_renderer,.renderer_name=neo_linux_renderer_name,.audio=neo_linux_audio,
-        .audio_stats=neo_linux_audio_stats,.clipboard=neo_linux_clipboard,.position=neo_linux_position,.destroy=neo_linux_destroy};
+        .audio_stats=neo_linux_audio_stats,.clipboard=neo_linux_clipboard,.position=neo_linux_position,.destroy=neo_linux_destroy,.appearance=neo_linux_appearance,.user_directory=neo_linux_user_directory,.directory_list=neo_linux_directory_list,.file_read=neo_linux_file_read};
     neo_capabilities capabilities={.host_windows=linux->display!=NULL,.input=linux->display!=NULL,.surfaces=linux->display!=NULL,
         .storage=true,.network=true,.entropy=true,.native_isolation=true};
     neo_status status=neo_services_open(&backend,linux,capabilities,output); if (status!=NEO_OK) { neo_linux_destroy(linux); } return status;
@@ -578,8 +645,8 @@ bool neo_platform_services_selftest(void) {
     char file[128]; snprintf(file,sizeof(file),"%s/sample.data",directory); unlink(file); snprintf(file,sizeof(file),"%s/sample.lock",directory); unlink(file); rmdir(directory);
     if (passed) {
         const unsigned char socket_attempt[]={0xb8,41,0,0,0,0xbf,2,0,0,0,0xbe,1,0,0,0,0x31,0xd2,0x0f,0x05,0xc3};
-        int32_t slots[NEO_NATIVE_SLOTS]={7}; int64_t result=13;
-        const char *failure=neo_native_execute(socket_attempt,sizeof(socket_attempt),slots,&result);
+        int32_t slots[8]={7}; int64_t result=13;
+        const char *failure=neo_native_execute(socket_attempt,sizeof(socket_attempt),slots,8,&result);
         passed=failure && !strcmp(failure,"native worker failed") && slots[0]==7 && result==13;
     }
     if (passed) { puts("PASS Linux services: scoped storage, conditional writes, tombstones, and seccomp syscall denial"); }

@@ -1,0 +1,6 @@
+{
+  "format": "neo.plugin/1", "id": "neo.cpu.x86_64", "version": 1,
+  "collection": "depth", "kind": "native", "role": "library", "requires": [],
+  "sources": ["cpu/x86_64.c"],
+  "targets": {"x86_64/Windows": {}, "x86_64/Linux": {}, "x86_64/x86_64": {}}
+}

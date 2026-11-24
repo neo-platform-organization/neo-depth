@@ -3,6 +3,7 @@
 #include "platform.h"
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <sys/prctl.h>
@@ -29,17 +30,19 @@ void *neo_platform_calloc(size_t count, size_t bytes) { return count && bytes>SI
 void *neo_platform_realloc(void *memory, size_t bytes) { return realloc(memory,bytes ? bytes : 1); }
 void neo_platform_free(void *memory) { free(memory); }
 typedef struct {
-    size_t length; unsigned char code[NEO_NATIVE_CODE_LIMIT];
-    int32_t slots[NEO_NATIVE_SLOTS]; int64_t result; bool complete;
+    size_t length, capacity, words; int64_t result; bool complete;
+    unsigned char code[NEO_NATIVE_CODE_LIMIT]; int32_t slots[];
 } neo_linux_packet;
-static struct { pid_t pid; int socket; neo_linux_packet *packet; } neo_linux_native={0,-1,NULL};
+static size_t neo_packet_bytes(size_t capacity) { return offsetof(neo_linux_packet,slots)+capacity*sizeof(int32_t); }
+static struct { pid_t pid; int socket; neo_linux_packet *packet; size_t capacity, bytes; } neo_linux_native={.socket=-1};
 static bool neo_linux_keep;
 uint32_t neo_native_worker_id(void) { return (uint32_t)neo_linux_native.pid; }
 void neo_native_end(void) {
     if (neo_linux_native.pid) { kill(neo_linux_native.pid,SIGKILL); while (waitpid(neo_linux_native.pid,NULL,0)<0 && errno==EINTR) {} }
     if (neo_linux_native.socket>=0) { close(neo_linux_native.socket); }
-    if (neo_linux_native.packet) { munmap(neo_linux_native.packet,sizeof(*neo_linux_native.packet)); }
-    neo_linux_native.pid=0; neo_linux_native.socket=-1; neo_linux_native.packet=NULL; neo_linux_keep=false;
+    if (neo_linux_native.packet) { munmap(neo_linux_native.packet,neo_linux_native.bytes); }
+    neo_linux_native.pid=0; neo_linux_native.socket=-1; neo_linux_native.packet=NULL;
+    neo_linux_native.capacity=0; neo_linux_native.bytes=0; neo_linux_keep=false;
 }
 void neo_native_begin(void) { neo_native_end(); neo_linux_keep=true; }
 int neo_native_worker(const char *text) {
@@ -47,7 +50,14 @@ int neo_native_worker(const char *text) {
     if (*end!=',' || mapping<0 || mapping>INT_MAX) { return 1; }
     long channel=strtol(end+1,&end,10);
     if (*end || channel<0 || channel>INT_MAX || channel==mapping) { return 1; }
+    struct stat info;
+    if (fstat((int)mapping,&info) || info.st_size<(off_t)sizeof(neo_linux_packet)) { return 1; }
     neo_linux_packet *packet=mmap(NULL,sizeof(*packet),PROT_READ|PROT_WRITE,MAP_SHARED,(int)mapping,0);
+    if (packet==MAP_FAILED) { return 1; }
+    size_t capacity=packet->capacity;
+    munmap(packet,sizeof(*packet));
+    if (!capacity || capacity>NEO_NATIVE_SLOTS || info.st_size!=(off_t)neo_packet_bytes(capacity)) { return 1; }
+    packet=mmap(NULL,neo_packet_bytes(capacity),PROT_READ|PROT_WRITE,MAP_SHARED,(int)mapping,0);
     if (packet==MAP_FAILED) { return 1; }
     close((int)mapping);
     if (channel) { close_range(0,(unsigned)channel-1u,0); }
@@ -71,27 +81,37 @@ int neo_native_worker(const char *text) {
         char signal;
         if (read((int)channel,&signal,1)!=1) { _exit(1); }
         size_t length=packet->length;
-        if (!length || length>NEO_NATIVE_CODE_LIMIT) { _exit(1); }
+        size_t words=packet->words;
+        if (!length || length>NEO_NATIVE_CODE_LIMIT || packet->capacity!=capacity || !words || words>capacity) { _exit(1); }
         void *code=mmap(NULL,length,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
         if (code==MAP_FAILED) { _exit(1); }
         memcpy(code,packet->code,length);
         if (mprotect(code,length,PROT_READ|PROT_EXEC)) { _exit(1); }
         int64_t (__attribute__((ms_abi)) *entry)(int32_t *);
         memcpy(&entry,&code,sizeof(entry));
-        packet->result=entry(packet->slots); munmap(code,length); packet->complete=true;
+        packet->result=entry(packet->slots); munmap(code,length);
+        if (packet->capacity!=capacity || packet->words!=words || packet->length!=length) { _exit(1); }
+        packet->complete=true;
         if (write((int)channel,"x",1)!=1) { _exit(1); }
     }
 }
-const char *neo_native_execute(const unsigned char *code, size_t length, int32_t *slots, int64_t *result) {
+const char *neo_native_execute(const unsigned char *code, size_t length, int32_t *slots, size_t words, int64_t *result) {
     if (!length || length>NEO_NATIVE_CODE_LIMIT) { return "invalid native code length"; }
+    size_t capacity=neo_native_capacity(words);
+    if (!capacity || !slots || !result) { return "invalid native frame size"; }
+    if (neo_linux_native.pid && words>neo_linux_native.capacity) {
+        bool keep=neo_linux_keep; neo_native_end(); neo_linux_keep=keep;
+    }
     if (!neo_linux_native.pid) {
         int mapping=memfd_create("neo.native",0), channels[2];
         if (mapping<0) { return "could not configure native worker"; }
-        if (ftruncate(mapping,(off_t)sizeof(neo_linux_packet)) || socketpair(AF_UNIX,SOCK_STREAM,0,channels)) {
+        size_t packet_bytes=neo_packet_bytes(capacity);
+        if (ftruncate(mapping,(off_t)packet_bytes) || socketpair(AF_UNIX,SOCK_STREAM,0,channels)) {
             close(mapping); return "could not configure native worker";
         }
-        neo_linux_packet *packet=mmap(NULL,sizeof(*packet),PROT_READ|PROT_WRITE,MAP_SHARED,mapping,0);
+        neo_linux_packet *packet=mmap(NULL,packet_bytes,PROT_READ|PROT_WRITE,MAP_SHARED,mapping,0);
         if (packet==MAP_FAILED) { close(mapping); close(channels[0]); close(channels[1]); return "could not configure native worker"; }
+        packet->capacity=capacity;
         char handles[64]; snprintf(handles,sizeof(handles),"%d,%d",mapping,channels[1]);
         pid_t pid=fork();
         if (!pid) {
@@ -99,19 +119,22 @@ const char *neo_native_execute(const unsigned char *code, size_t length, int32_t
             execl("/proc/self/exe","neo","--native-worker",handles,(char *)NULL); _exit(1);
         }
         close(mapping); close(channels[1]);
-        if (pid<0) { close(channels[0]); munmap(packet,sizeof(*packet)); return "could not configure native worker"; }
+        if (pid<0) { close(channels[0]); munmap(packet,packet_bytes); return "could not configure native worker"; }
         neo_linux_native.pid=pid; neo_linux_native.socket=channels[0]; neo_linux_native.packet=packet;
+        neo_linux_native.capacity=capacity; neo_linux_native.bytes=packet_bytes;
     }
     neo_linux_packet *packet=neo_linux_native.packet;
-    packet->length=length; packet->complete=false; memcpy(packet->code,code,length); memcpy(packet->slots,slots,sizeof(packet->slots));
+    packet->length=length; packet->words=words; packet->complete=false; memcpy(packet->code,code,length);
+    memset(packet->slots,0,neo_linux_native.capacity*sizeof(*slots)); memcpy(packet->slots,slots,words*sizeof(*slots));
     const char *failure=NULL;
     if (send(neo_linux_native.socket,"x",1,MSG_NOSIGNAL)!=1) { failure="native worker failed"; }
     struct pollfd ready={neo_linux_native.socket,POLLIN,0};
     int status=failure ? -1 : poll(&ready,1,2000);
     if (!failure && status==0) { failure="native worker timed out"; }
     char response;
-    if (!failure && (status<0 || recv(neo_linux_native.socket,&response,1,0)!=1 || !packet->complete)) { failure="native worker failed"; }
-    if (!failure) { memcpy(slots,packet->slots,sizeof(packet->slots)); *result=packet->result; }
+    if (!failure && (status<0 || recv(neo_linux_native.socket,&response,1,0)!=1 || !packet->complete ||
+        packet->words!=words || packet->capacity!=neo_linux_native.capacity || packet->length!=length)) { failure="native worker failed"; }
+    if (!failure) { memcpy(slots,packet->slots,words*sizeof(*slots)); *result=packet->result; }
     if (failure || !neo_linux_keep) { bool keep=neo_linux_keep; neo_native_end(); neo_linux_keep=keep; }
     return failure;
 }

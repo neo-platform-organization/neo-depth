@@ -123,6 +123,7 @@ int snprintf(char *out,size_t n,const char *format,...) { va_list args; va_start
 FILE *stdin=(FILE *)1,*stdout=(FILE *)2,*stderr=(FILE *)3;
 int fputs(const char *s,FILE *file) { (void)file; neo_x86_64_serial(s); return 0; }
 int puts(const char *s) { neo_x86_64_serial(s); neo_x86_64_serial_byte('\n'); return 0; }
+int putc(int byte,FILE *file) { (void)file; neo_x86_64_serial_byte((unsigned char)byte); return (unsigned char)byte; }
 static int neo_serial_format(const char *format,va_list args) {
     va_list copy;va_copy(copy,args);int length=vsnprintf(NULL,0,format,copy);va_end(copy);
     if(length<0) { return length; }char *buffer=malloc((size_t)length+1);if(!buffer) { return -1; }
@@ -131,14 +132,15 @@ static int neo_serial_format(const char *format,va_list args) {
 int printf(const char *format,...) { va_list args;va_start(args,format);int result=neo_serial_format(format,args);va_end(args);return result; }
 int fprintf(FILE *file,const char *format,...) { (void)file;va_list args;va_start(args,format);int result=neo_serial_format(format,args);va_end(args);return result; }
 int fflush(FILE *file) { (void)file; return 0; }
-typedef struct { size_t position; bool eof; } neo_file;
-FILE *fopen(const char *path,const char *mode) { if(strcmp(mode,"rb") || strcmp(path,"neo/neo-os/image.neo")) { return NULL; }
-    return calloc(1,sizeof(FILE)>sizeof(neo_file) ? sizeof(FILE):sizeof(neo_file)); }
+typedef struct { size_t position; bool eof; const char *source; } neo_file;
+FILE *fopen(const char *path,const char *mode) { const char *source=neo_x86_64_lookup(path); if(strcmp(mode,"rb") || !source) { return NULL; }
+    neo_file *file=calloc(1,sizeof(FILE)>sizeof(neo_file) ? sizeof(FILE):sizeof(neo_file));
+    if(file) { file->source=source; } return (FILE *)file; }
 size_t fread(void *out,size_t size,size_t count,FILE *file) { neo_file *input=(neo_file *)file;
-    if(!size || count>SIZE_MAX/size) { return 0; } size_t available=strlen(neo_x86_64_image)-input->position;
+    if(!size || count>SIZE_MAX/size) { return 0; } size_t available=strlen(input->source)-input->position;
     size_t bytes=size*count; if(bytes>available) { bytes=available; input->eof=true; }
-    memcpy(out,neo_x86_64_image+input->position,bytes); input->position+=bytes; return bytes/size; }
-int fgetc(FILE *file) { neo_file *input=(neo_file *)file; if(!neo_x86_64_image[input->position]) { input->eof=true; return EOF; } return (unsigned char)neo_x86_64_image[input->position++]; }
+    memcpy(out,input->source+input->position,bytes); input->position+=bytes; return bytes/size; }
+int fgetc(FILE *file) { neo_file *input=(neo_file *)file; if(!input->source[input->position]) { input->eof=true; return EOF; } return (unsigned char)input->source[input->position++]; }
 int feof(FILE *file) { return ((neo_file *)file)->eof; }
 int ferror(FILE *file) { (void)file; return 0; }
 int fclose(FILE *file) { free(file); return 0; }

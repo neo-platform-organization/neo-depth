@@ -9,6 +9,7 @@ void neo_x86_64_heap(void *,size_t);
 void neo_x86_64_interrupts(void);
 extern volatile uint64_t neo_x86_64_ticks;
 extern const char *neo_x86_64_image;
+const char *neo_x86_64_lookup(const char *);
 static inline unsigned char neo_in(unsigned short port) { unsigned char value; __asm__ volatile("inb %1,%0":"=a"(value):"Nd"(port)); return value; }
 static inline void neo_out(unsigned short port, unsigned char value) { __asm__ volatile("outb %0,%1"::"a"(value),"Nd"(port)); }
 static inline uint64_t neo_tsc(void) { uint32_t lo,hi; __asm__ volatile("rdtsc":"=a"(lo),"=d"(hi)); return ((uint64_t)hi<<32)|lo; }

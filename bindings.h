@@ -18,4 +18,6 @@
 #define neo_console_open neo_depth_console_open
 #define neo_console_close neo_depth_console_close
 #define neo_platform_read_line neo_depth_read_line
+#define neo_platform_arguments neo_depth_arguments
+#define neo_platform_file_open neo_depth_file_open
 #endif
